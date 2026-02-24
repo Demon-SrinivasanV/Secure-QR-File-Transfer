@@ -12,11 +12,11 @@ Two main functions:
    Missing or unreadable QR codes are reported.
 
 Usage:
-% > python qr_file_transfer.py generate \
+% > python Secure_QR_File_Transfer.py generate \
       /path/to/file/file.ext \
       /path/to/QR \
       yourFavouritePassword
-% > python qr_file_transfer.py recover \ 
+% > python Secure_QR_File_Transfer.py recover \ 
       /path/to/QR \
       yourFavouritePassword \
       --out /path/to/Output/Folder/newFile.ext
