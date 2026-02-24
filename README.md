@@ -30,7 +30,7 @@ pip install "qrcode[pil]" pillow pyzbar opencv-python cryptography
 ### Generate QR codes from a file
 
 ```bash
-python qr_file_transfer.py generate \
+python secure_.py generate \
     /path/to/input/file.ext \
     /path/to/output/qr_folder \
     yourPassword
@@ -48,7 +48,7 @@ file_qr_000002.png
 ### Recover a file from QR codes
 
 ```bash
-python qr_file_transfer.py recover \
+python secure_.py recover \
     /path/to/qr_folder \
     yourPassword \
     --out /path/to/output/recovered_file.ext
@@ -91,10 +91,10 @@ Each chunk is independently encrypted with a unique nonce. A wrong password or c
 
 ```bash
 # Split and encrypt a PDF
-python qr_file_transfer.py generate report.pdf ./qr_codes secret123
+python secure_.py generate report.pdf ./qr_codes secret123
 
 # Reconstruct it from the QR images
-python qr_file_transfer.py recover ./qr_codes secret123 --out report_recovered.pdf
+python secure_qr_file_transfer.py recover ./qr_codes secret123 --out report_recovered.pdf
 ```
 
 ---
