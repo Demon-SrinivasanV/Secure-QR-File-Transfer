@@ -48,6 +48,7 @@ try:
 except ImportError:
     pyzbar_decode = None
 import cv2
+import numpy as np
 
 # ---------------------------------------------------------------------------
 # Encryption helpers
@@ -125,6 +126,20 @@ def chunk_and_generate(input_path: str, output_dir: str, password: str) -> None:
             b64_str = base64.b64encode(payload).decode("ascii")
             _save_qr(b64_str, output_dir / f"{base_name}_qr_{seq:06d}.png")
             seq += 1
+    # Build an MP4 video from the generated QR images.
+    qr_images = sorted(output_dir.glob(f"{base_name}_qr_*.png"))
+    if qr_images:
+        first = cv2.imread(str(qr_images[0]))
+        h, w = first.shape[:2]
+        video_path = output_dir / f"{base_name}_qr.mp4"
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(str(video_path), fourcc, 1.0, (w, h))
+        for img_path in qr_images:
+            frame = cv2.imread(str(img_path))
+            writer.write(frame)
+        writer.release()
+        print(f"Generated video: {video_path}")
+
     print(f"Generated {seq} QR code images (1 salt + {seq-1} data) in {output_dir}")
 
 
@@ -167,7 +182,6 @@ def _extract_payload_from_qr(image: Image.Image) -> Optional[str]:
 
     # Fallback to OpenCV QRCodeDetector
     try:
-        import numpy as np
         cv_img = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
         detector = cv2.QRCodeDetector()
         data, points, _ = detector.detectAndDecode(cv_img)
@@ -178,11 +192,83 @@ def _extract_payload_from_qr(image: Image.Image) -> Optional[str]:
     return None
 
 
+def _is_blurry(cv_frame, threshold: float = 50.0) -> bool:
+    """Return True if the frame is too blurry to decode a QR code."""
+    gray = cv2.cvtColor(cv_frame, cv2.COLOR_BGR2GRAY)
+    return cv2.Laplacian(gray, cv2.CV_64F).var() < threshold
+
+
+def _preprocess_frame(cv_frame):
+    """
+    Yield increasingly aggressive image preprocessing variants of a cv2 frame.
+    Each variant is a Pillow image suitable for QR decoding.
+    This helps decode QR codes from phone camera footage with perspective
+    distortion, uneven lighting, or slight blur.
+    """
+    # 1. Original frame as-is
+    yield Image.fromarray(cv2.cvtColor(cv_frame, cv2.COLOR_BGR2RGB))
+
+    gray = cv2.cvtColor(cv_frame, cv2.COLOR_BGR2GRAY)
+
+    # 2. Sharpened grayscale
+    kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
+    sharpened = cv2.filter2D(gray, -1, kernel)
+    yield Image.fromarray(sharpened)
+
+    # 3. Adaptive threshold (handles uneven lighting)
+    thresh = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 51, 11
+    )
+    yield Image.fromarray(thresh)
+
+    # 4. OTSU threshold on sharpened
+    _, otsu = cv2.threshold(sharpened, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    yield Image.fromarray(otsu)
+
+
+def _extract_payload_from_frame(cv_frame) -> Optional[str]:
+    """
+    Try to decode a QR code from a cv2 BGR frame using multiple preprocessing
+    passes. Returns the payload string on first successful decode, else None.
+    """
+    for pil_img in _preprocess_frame(cv_frame):
+        result = _extract_payload_from_qr(pil_img)
+        if result is not None:
+            return result
+    return None
+
+
+def _parse_qr_payload(raw_str: str) -> Tuple[Optional[int], Optional[bytes]]:
+    """
+    Parse a decoded QR string into (seq, payload_bytes).
+    seq == 0  -> payload is the raw 16-byte salt.
+    seq >= 1  -> payload is: nonce(12) + tag(16) + ciphertext.
+    Returns (None, None) if malformed.
+    """
+    if raw_str.startswith("SALT:"):
+        try:
+            salt = base64.b64decode(raw_str[5:])
+        except Exception:
+            return None, None
+        return 0, salt
+
+    try:
+        decoded = base64.b64decode(raw_str)
+    except Exception:
+        return None, None
+
+    if len(decoded) < 32:
+        return None, None
+
+    seq = struct.unpack(">I", decoded[:4])[0]
+    return seq, decoded[4:]
+
+
 def _process_qr_file(path: Path) -> Tuple[Optional[int], Optional[bytes]]:
     """
     Return (seq, payload_bytes) for a QR image file.
-    seq == 0  → payload is the raw 16-byte salt.
-    seq >= 1  → payload is: nonce(12) + tag(16) + ciphertext.
+    seq == 0  -> payload is the raw 16-byte salt.
+    seq >= 1  -> payload is: nonce(12) + tag(16) + ciphertext.
     Returns (None, None) if unreadable or malformed.
     """
     try:
@@ -194,82 +280,177 @@ def _process_qr_file(path: Path) -> Tuple[Optional[int], Optional[bytes]]:
     if raw_str is None:
         return None, None
 
-    """
-    FIX: Salt QR codes now use the text prefix "SALT:" followed by base64 salt.
-         Previously the code stored raw bytes starting with b"SALT" which was
-         ambiguous when the qrcode library re-encoded them.
-    """
-    if raw_str.startswith("SALT:"):
-        try:
-            salt = base64.b64decode(raw_str[5:])
-        except Exception:
-            return None, None
-        return 0, salt
-
-    # Data QR codes: the entire string is base64-encoded binary payload.
-    try:
-        decoded = base64.b64decode(raw_str)
-    except Exception:
-        return None, None
-
-    # Minimum: 4 (seq) + 12 (nonce) + 16 (tag) = 32 bytes.
-    if len(decoded) < 32:
-        return None, None
-
-    seq = struct.unpack(">I", decoded[:4])[0]
-    # Return everything after the 4-byte sequence number.
-    return seq, decoded[4:]
+    return _parse_qr_payload(raw_str)
 
 
 def read_and_assemble(source_path: str, password: str, output_path: Optional[str] = None) -> None:
     # Read QR codes from *source_path* (directory, image, or video) and rebuild file.
     src = Path(source_path)
-    image_paths: List[Path] = []
-    temp_paths: List[Path] = []                                 # track temp video-frame files for cleanup
+    chunks: dict = {}
+    salt: Optional[bytes] = None
+    is_video = False
 
     if src.is_dir():
-        image_paths.extend(
-            p for p in sorted(src.iterdir())
+        image_paths = sorted(
+            p for p in src.iterdir()
             if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".bmp"}
         )
+        for p in image_paths:
+            seq, payload = _process_qr_file(p)
+            if seq is None:
+                print(f"Unreadable QR in {p.name}")
+                continue
+            if seq == 0:
+                salt = payload
+            else:
+                chunks[seq] = payload
+
     elif src.is_file():
         if src.suffix.lower() in {".png", ".jpg", ".jpeg", ".bmp"}:
-            image_paths.append(src)
+            seq, payload = _process_qr_file(src)
+            if seq is None:
+                raise RuntimeError(f"Could not decode QR from {src}")
+            if seq == 0:
+                salt = payload
+            else:
+                chunks[seq] = payload
+
         elif src.suffix.lower() in {".mp4", ".avi", ".mov", ".mkv"}:
+            is_video = True
             cap = cv2.VideoCapture(str(src))
-            idx = 0
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            fps = cap.get(cv2.CAP_PROP_FPS) or 30
+            frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            decoded_count = 0
+            skipped_blur = 0
+            skipped_dup = 0
+            frame_idx = 0
+            max_seq_seen = 0
+            retry_positions: list = []
+
+            # Downscale large frames for faster processing.
+            # Version 40 QR codes (177x177 modules) need ~1800px to resolve.
+            max_dim = 2000
+            scale = 1.0
+            if max(frame_w, frame_h) > max_dim:
+                scale = max_dim / max(frame_w, frame_h)
+            new_w = int(frame_w * scale)
+            new_h = int(frame_h * scale)
+
+            # Sample ~10 frames per second of video.
+            sample_interval = max(1, int(fps // 10))
+
+            print(f"Video: {total_frames} frames, {fps:.1f}fps, {frame_w}x{frame_h} "
+                  f"-> {new_w}x{new_h}, sampling every {sample_interval} frames")
+
+            # --- Pass 1: fast pyzbar-only scan -------------------------
             while True:
                 ret, frame = cap.read()
                 if not ret:
                     break
+                frame_idx += 1
+
+                if frame_idx % sample_interval != 0:
+                    continue
+
+                # Downscale for speed.
+                if scale < 1.0:
+                    frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+                if _is_blurry(frame):
+                    skipped_blur += 1
+                    continue
+
                 pil_img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-                temp_path = src.parent / f"__frame_{idx}.png"
-                pil_img.save(temp_path)
-                image_paths.append(temp_path)
-                temp_paths.append(temp_path)
-                idx += 1
+                raw_str = _extract_payload_from_qr(pil_img)
+
+                if raw_str is None:
+                    retry_positions.append(frame_idx)
+                    continue
+
+                seq, payload = _parse_qr_payload(raw_str)
+                if seq is None:
+                    continue
+
+                if seq == 0:
+                    if salt is None:
+                        salt = payload
+                        decoded_count += 1
+                    else:
+                        skipped_dup += 1
+                elif seq not in chunks:
+                    chunks[seq] = payload
+                    decoded_count += 1
+                    if seq > max_seq_seen:
+                        max_seq_seen = seq
+                else:
+                    skipped_dup += 1
+
+                # Progress every 20 new decodes.
+                if decoded_count % 20 == 0 and decoded_count > 0:
+                    print(f"  ... {decoded_count} unique QRs so far (frame {frame_idx}/{total_frames})")
+
             cap.release()
+            print(f"Pass 1: {decoded_count} unique QRs, {skipped_blur} blurry, "
+                  f"{skipped_dup} duplicates, {len(retry_positions)} undecoded")
+
+            # --- Pass 2: retry failed frames with preprocessing --------
+            expected_total = max_seq_seen + 1
+            have_count = len(chunks) + (1 if salt else 0)
+            missing = expected_total - have_count if expected_total > 0 else len(retry_positions)
+
+            if missing > 0 and retry_positions:
+                print(f"Pass 2: retrying {len(retry_positions)} frames ({missing} QRs missing)...")
+                cap = cv2.VideoCapture(str(src))
+                retry_set = set(retry_positions)
+                frame_idx = 0
+                pass2_decoded = 0
+
+                while True:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    frame_idx += 1
+                    if frame_idx not in retry_set:
+                        continue
+
+                    if scale < 1.0:
+                        frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+                    raw_str = _extract_payload_from_frame(frame)
+                    if raw_str is None:
+                        continue
+
+                    seq, payload = _parse_qr_payload(raw_str)
+                    if seq is None:
+                        continue
+
+                    if seq == 0 and salt is None:
+                        salt = payload
+                        pass2_decoded += 1
+                    elif seq > 0 and seq not in chunks:
+                        chunks[seq] = payload
+                        pass2_decoded += 1
+                        if seq > max_seq_seen:
+                            max_seq_seen = seq
+
+                    have_count = len(chunks) + (1 if salt else 0)
+                    if max_seq_seen > 0 and have_count >= max_seq_seen + 1:
+                        break
+
+                cap.release()
+                decoded_count += pass2_decoded
+                print(f"Pass 2: recovered {pass2_decoded} additional QRs")
+
+            print(f"Video total: {decoded_count} unique QRs decoded")
         else:
             raise ValueError("Unsupported file type for source_path")
     else:
         raise FileNotFoundError(f"{source_path} does not exist")
 
-    # Parse each QR image.
-    chunks: dict = {}
-    salt: Optional[bytes] = None
-
-    for p in image_paths:
-        seq, payload = _process_qr_file(p)
-        if seq is None:
-            print(f"Unreadable QR in {p.name}")
-            continue
-        if seq == 0:
-            salt = payload
-            continue
-        chunks[seq] = payload
-
     if salt is None:
-        raise RuntimeError("Salt QR (sequence 0) not found – cannot derive key")
+        raise RuntimeError("Salt QR (sequence 0) not found - cannot derive key")
 
     if not chunks:
         raise RuntimeError("No data QR codes found")
@@ -283,7 +464,8 @@ def read_and_assemble(source_path: str, password: str, output_path: Optional[str
     # Detect missing sequence numbers.
     missing_seqs = [i for i in range(1, max_seq + 1) if i not in chunks]
     if missing_seqs:
-        print("Missing QR code sequence numbers:", ", ".join(map(str, missing_seqs)))
+        print(f"Missing QR code sequence numbers ({len(missing_seqs)}): "
+              + ", ".join(map(str, missing_seqs)))
         print("Aborting: missing QR code(s) prevent reconstruction.")
         return
 
@@ -311,13 +493,6 @@ def read_and_assemble(source_path: str, password: str, output_path: Optional[str
     with open(output_path, "wb") as out_f:
         out_f.write(assembled)
     print(f"Reconstructed file written to {output_path}")
-
-    # Cleanup temporary video frames.
-    for p in temp_paths:
-        try:
-            p.unlink()
-        except Exception:
-            pass
 
 
 # ---------------------------------------------------------------------------
