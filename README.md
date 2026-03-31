@@ -18,7 +18,7 @@ Each QR code holds up to **2,182 bytes** of plaintext data. Larger files simply 
 Install dependencies via pip:
 
 ```bash
-pip install "qrcode[pil]" pillow pyzbar opencv-python cryptography
+pip install "qrcode[pil]" pillow pyzbar opencv-python numpy cryptography
 ```
 
 > **Note:** `pyzbar` requires the `zbar` shared library. On macOS: `brew install zbar`. On Ubuntu/Debian: `sudo apt-get install libzbar0`.
@@ -30,25 +30,28 @@ pip install "qrcode[pil]" pillow pyzbar opencv-python cryptography
 ### Generate QR codes from a file
 
 ```bash
-python secure_qr_file_transfer.py generate \
+python Secure_QR_File_Transfer.py generate \
     /path/to/input/file.ext \
     /path/to/output/qr_folder \
     yourPassword
 ```
 
-This produces a series of numbered PNG images in the output folder:
+This produces a series of numbered PNG images **and an MP4 video** in the output folder:
 
 ```
 file_qr_000000.png   ← salt QR (sequence 0)
 file_qr_000001.png
 file_qr_000002.png
 ...
+file_qr.mp4          ← video of all QR codes (1 fps)
 ```
+
+The MP4 video plays each QR code as a frame at 1 fps, making it easy to transfer by recording the screen with a phone camera.
 
 ### Recover a file from QR codes
 
 ```bash
-python secure_qr_file_transfer.py recover \
+python Secure_QR_File_Transfer.py recover \
     /path/to/qr_folder \
     yourPassword \
     --out /path/to/output/recovered_file.ext
@@ -60,7 +63,7 @@ The source path can be:
 
 - A **directory** of PNG/JPG/BMP images
 - A **single image** file
-- A **video file** (MP4, AVI, MOV, MKV) — frames are extracted and scanned automatically
+- A **video file** (MP4, AVI, MOV, MKV) — decoded using a two-pass approach: a fast scan followed by retry with image preprocessing (sharpening, adaptive thresholding) for frames that failed on the first pass. Blurry frames are automatically skipped, and large frames are downscaled for performance.
 
 ---
 
@@ -81,7 +84,7 @@ Each chunk is independently encrypted with a unique nonce. A wrong password or c
 ## Limitations & Notes
 
 - **All QR codes are required.** If any data QR code (sequence ≥ 1) is missing or unreadable, recovery aborts. The salt QR (sequence 0) is also mandatory.
-- **QR scanning quality matters.** Images should be well-lit and in focus. The tool tries `pyzbar` first and falls back to OpenCV's built-in detector.
+- **QR scanning quality matters.** Images should be well-lit and in focus. The tool tries `pyzbar` first and falls back to OpenCV's built-in detector. For video input, multiple preprocessing passes (sharpening, adaptive threshold, OTSU binarization) are applied to recover QR codes from imperfect footage.
 - **Large files produce many QR codes.** At ~2 KB per chunk, a 1 MB file requires roughly 470 QR images.
 - The tool does not currently support partial recovery or forward error correction across chunks.
 
@@ -91,10 +94,10 @@ Each chunk is independently encrypted with a unique nonce. A wrong password or c
 
 ```bash
 # Split and encrypt a PDF
-python secure_qr_file_transfer.py generate report.pdf ./qr_codes secret123
+python Secure_QR_File_Transfer.py generate report.pdf ./qr_codes secret123
 
 # Reconstruct it from the QR images
-python secure_qr_file_transfer.py recover ./qr_codes secret123 --out report_recovered.pdf
+python Secure_QR_File_Transfer.py recover ./qr_codes secret123 --out report_recovered.pdf
 ```
 
 ---
@@ -107,4 +110,5 @@ python secure_qr_file_transfer.py recover ./qr_codes secret123 --out report_reco
 | `qrcode[pil]` | QR code generation |
 | `pillow` | Image I/O |
 | `pyzbar` | Fast QR code decoding (primary decoder) |
-| `opencv-python` | Fallback QR decoder and video frame extraction |
+| `opencv-python` | Fallback QR decoder, video frame extraction, and MP4 generation |
+| `numpy` | Image preprocessing for video frame QR decoding |
