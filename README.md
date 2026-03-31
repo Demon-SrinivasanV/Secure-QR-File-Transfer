@@ -42,11 +42,12 @@ This produces a series of numbered PNG images **and an MP4 video** in the output
 file_qr_000000.png   ← salt QR (sequence 0)
 file_qr_000001.png
 file_qr_000002.png
-...
-file_qr.mp4          ← video of all QR codes (1 fps)
+```
+```
+file_qr.mp4          ← video of all QR codes
 ```
 
-The MP4 video plays each QR code as a frame at 1 fps, making it easy to transfer by recording the screen with a phone camera.
+The MP4 video plays each QR code as a frame, making it easy to transfer by recording the screen with a phone camera.
 
 ### Recover a file from QR codes
 
